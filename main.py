@@ -30,6 +30,11 @@ class Building:
         command_string = f"TUBE {self.building_id} {other_building.building_id}"
         return distance, command_string
 
+    def upgrade_tube(self, other_building, new_capacity=2):
+        cost = self.distance_to(other_building) * new_capacity
+        command_string = f"UPGRADE {self.building_id} {other_building.building_id}"
+        return cost, command_string
+
     @classmethod
     def from_string(cls, input_string, landing_pads, modules):
         building_type, *values = map(int, input_string.split())
@@ -38,7 +43,10 @@ class Building:
             landing_pads.append(landing_pad)
             return landing_pad
         module = Module(building_type, *values)
-        modules.append(module)
+        if module.module_type in modules:
+            modules[module.module_type].append(module)
+        else:
+            modules[module.module_type] = [module]
         return module
 
 
@@ -76,7 +84,47 @@ class Module(Building):
         return f"{super_repr}{self.building_id}"
 
 
-def create_action_commands(resources, transportation_infrastructure, pods, all_buildings, landing_pads, modules: list[Module]):
+def estimate_traveling_astronauts(landing_pads, transportation_infrastructure):
+    list_of_routes = []
+    for landing_pad in landing_pads:
+        if landing_pad in transportation_infrastructure:
+            for astronaut_type, astronauts in landing_pad.astronauts.items():
+                _, infrastructures = find_optimal_route(transportation_infrastructure,
+                                                        transportation_infrastructure[landing_pad],
+                                                        astronaut_type, astronauts)
+                for infrastructure in infrastructures:
+                    infrastructure.add_astronauts(astronauts)
+                list_of_routes.append(infrastructures)
+    list_of_upgrade_required_infrastructure = []
+    for infrastructures in list_of_routes:
+        at_least_one_needs_upgrade = False
+        for infrastructure in infrastructures:
+            if infrastructure.needs_upgrade:
+                at_least_one_needs_upgrade = True
+                break
+        if at_least_one_needs_upgrade:
+            list_of_upgrade_required_infrastructure.append(infrastructures)
+    return list_of_upgrade_required_infrastructure
+
+
+def find_optimal_route(all_infrastructures, infrastructures, astronaut_type, astronauts):
+    best_value = None
+    best_infrastructures = None
+    for infrastructure in infrastructures:
+        building_to = infrastructure.to_building
+        if building_to.module_type == astronaut_type:
+            return 1, [infrastructure]
+        if building_to in all_infrastructures:
+            next_infrastructure = all_infrastructures[building_to]
+            length, route = find_optimal_route(all_infrastructures, next_infrastructure, astronaut_type, astronauts)
+            if best_value is None or length < best_value:
+                best_value = length
+                if best_infrastructures is None:
+                    best_infrastructures = [next_infrastructure] + route
+    return best_value + 1, best_infrastructures
+
+
+def create_action_commands(resources, transportation_infrastructure, pods, all_buildings, landing_pads, modules: dict[int, list[Module]]):
     pod_commands = ["POD {} 0 1 0 2 0", "POD {} 0 2 0 1 0"]
     POD_COST = 1000
     total_astronauts = {}
@@ -85,18 +133,26 @@ def create_action_commands(resources, transportation_infrastructure, pods, all_b
         total_astronauts.update(landing_pad.astronauts)
     debug(total_astronauts)
     command_string = []
+    pods_built = len(pods)
     if len(transportation_infrastructure) == 0:
         # TODO -- from the actual landing pad xD
-        accepting_astronauts = [building for building in modules if building.module_type in total_astronauts]
-        for module in accepting_astronauts:
+        modules_accepting_astronauts = [module_list for module_type, module_list in modules.items()
+                                        if module_type in total_astronauts]
+        for module_list in modules_accepting_astronauts:
+            module = module_list[0]  # TODO -- create a path of tubes / infrastructure to it
             resource_cost, tube_command = landing_pads[0].tube_to(module)
             resources -= resource_cost
             command_string.append(tube_command)
-
-    pods_built = len(pods)
-    if pods_built > 2:
-        # upgrade_capacity()
-        pass
+    elif pods_built > 2:  # TODO -- better estimation of when to upgrade
+        # TODO -- from the actual landing pad xD
+        infrastructure_requires_upgrade = estimate_traveling_astronauts(landing_pads, transportation_infrastructure)
+        for infrastructure_list in infrastructure_requires_upgrade:
+            for infrastructure in infrastructure_list:
+                _from, _to = infrastructure.from_building, infrastructure.to_building
+                resource_cost, upgrade_tube_command = _from.upgrade_tube(_to)
+                if resource_cost <= resources:
+                    resources -= resource_cost
+                    command_string.append(upgrade_tube_command)
 
     while resources >= POD_COST:
         resources -= POD_COST
@@ -104,7 +160,6 @@ def create_action_commands(resources, transportation_infrastructure, pods, all_b
         command_string.append(pod_commands[pods_built % len(pod_commands)].format(pods_built))
 
     return ';'.join(command_string) if len(command_string) > 0 else "WAIT"
-
 
 
 class Infrastructure:
@@ -116,6 +171,7 @@ class Infrastructure:
     def __init__(self, from_building, to_building):
         self.from_building = from_building
         self.to_building = to_building
+        self.traveling_astronauts = 0
 
     @classmethod
     def from_values(cls, building_from, building_to, capacity):
@@ -125,6 +181,16 @@ class Infrastructure:
 
     def __repr__(self):
         return f"{self.__class__.__name__}({self.from_building} -> {self.to_building}"
+
+    @property
+    def needs_upgrade(self):
+        return False
+
+    def add_astronauts(self, astronauts):
+        self.traveling_astronauts += astronauts
+
+    def desired_astronauts(self):
+        return self.traveling_astronauts
 
 
 class Teleporter(Infrastructure):
@@ -139,22 +205,30 @@ class Tube(Infrastructure):
         super().__init__(from_building, to_building)
         self.capacity = capacity
 
+    @property
+    def needs_upgrade(self):
+        return self.capacity * 10 < self.desired_astronauts()
+
 
 all_buildings = {}
 landing_pads = []
-modules = []
+modules = {}
 
 # game loop
 while True:
     resources = int(input())
     num_travel_routes = int(input())
-    transportation_infrastructure = []
+    transportation_infrastructure = {}
     for i in range(num_travel_routes):
         transport_id_from, transport_id_to, capacity = [int(j) for j in input().split()]
         building_from = all_buildings[transport_id_from]
         building_to = all_buildings[transport_id_to]
         transport = Infrastructure.from_values(building_from, building_to, capacity)
-        transportation_infrastructure.append(transport)
+        if building_from in transportation_infrastructure:
+            transportation_infrastructure[building_from].append(transport)
+        else:
+            transportation_infrastructure[building_from] = [transport]
+
     num_pods = int(input())
     pods = []
     for i in range(num_pods):
